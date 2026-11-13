@@ -1,0 +1,102 @@
+# Local stack: Postgres, Redis, Moto (an AWS SNS/SQS emulator; no AWS account
+# needed) and the pipeline services. Start everything with `make up`.
+#
+# Host ports use the 5xxxx range so they don't clash with anything you
+# already run locally.
+
+x-aws: &aws
+  AWS_ENDPOINT_URL: http://moto:5000
+  AWS_REGION: us-east-1
+  AWS_DEFAULT_REGION: us-east-1  # boto3 reads this one
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+
+x-db: &db
+  DATABASE_URL: postgres://postgres:postgres@postgres:5432/pipeline?sslmode=disable
+
+x-go-service: &go-service
+  build: .
+  image: event-pipeline:local
+  restart: unless-stopped
+  depends_on:
+    postgres: { condition: service_healthy }
+    bootstrap: { condition: service_completed_successfully }
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: pipeline
+      POSTGRES_PASSWORD: postgres
+    ports: ["55432:5432"]
+    volumes:
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "pipeline"]
+      interval: 1s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    ports: ["56379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      retries: 30
+
+  moto:
+    image: motoserver/moto:5.2.5
+    ports: ["55000:5000"]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:5000/moto-api/"]
+      interval: 1s
+      retries: 30
+
+  bootstrap:
+    build: .
+    image: event-pipeline:local
+    command: ["/app/bootstrap"]
+    environment:
+      <<: *aws
+      VISIBILITY_TIMEOUT_SECONDS: ${VISIBILITY_TIMEOUT_SECONDS:-30}
+      MAX_RECEIVE_COUNT: ${MAX_RECEIVE_COUNT:-5}
+    depends_on:
+      moto: { condition: service_healthy }
+
+  ingest:
+    <<: *go-service
+    command: ["/app/ingest"]
+    ports: ["58080:8080"]
+    environment:
+      <<: [*db]
+      CHAOS: ${INGEST_CHAOS:-}
+
+  relay:
+    <<: *go-service
+    command: ["/app/relay"]
+    environment:
+      <<: [*aws, *db]
+      TOPIC_ARN: arn:aws:sns:us-east-1:123456789012:payment-events
+      CHAOS: ${RELAY_CHAOS:-}
+
+  ledger-consumer:
+    <<: *go-service
+    command: ["/app/ledger-consumer"]
+    environment:
+      <<: [*aws, *db]
+      QUEUE_URL: http://moto:5000/123456789012/ledger-events
+      CHAOS: ${LEDGER_CHAOS:-}
+
+  analytics-consumer:
+    build: ./analytics
+    image: event-pipeline-analytics:local
+    restart: unless-stopped
+    environment:
+      <<: [*aws, *db]
+      QUEUE_URL: http://moto:5000/123456789012/analytics-events
+      REDIS_URL: redis://redis:6379/0
+      CHAOS: ${ANALYTICS_CHAOS:-}
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      bootstrap: { condition: service_completed_successfully }

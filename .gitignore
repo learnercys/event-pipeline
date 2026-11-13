@@ -1,0 +1,11 @@
+bin/
+*.json.tmp
+.idea/
+.vscode/
+.DS_Store
+
+# Python
+analytics/.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
