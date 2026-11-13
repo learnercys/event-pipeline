@@ -12,12 +12,19 @@ import (
 	"github.com/learnercys/event-pipeline/internal/config"
 	"github.com/learnercys/event-pipeline/internal/relay"
 	"github.com/learnercys/event-pipeline/internal/store"
+	"github.com/learnercys/event-pipeline/internal/telemetry"
 )
 
 func main() {
 	log := config.Logger("relay")
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	shutdown, err := telemetry.Setup(ctx, "relay", telemetry.OnlyContinueTraces())
+	if err != nil {
+		config.Fatal(err)
+	}
+	defer func() { _ = shutdown(context.Background()) }()
 
 	inj, err := chaos.FromEnv()
 	if err != nil {

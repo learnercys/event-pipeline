@@ -9,6 +9,7 @@ import time
 
 import boto3
 
+from analytics import telemetry
 from analytics.chaos import Chaos
 from analytics.consumer import Consumer
 from analytics.store import PostgresStore, RedisSeenCache
@@ -24,6 +25,7 @@ def main() -> None:
     )
     log = logging.getLogger("analytics")
 
+    provider = telemetry.setup()  # before connecting, so queries are instrumented
     chaos = Chaos(os.environ.get("CHAOS", ""))
     store = PostgresStore(os.environ["DATABASE_URL"])
     consumer = Consumer(
@@ -57,4 +59,6 @@ def main() -> None:
             last_report = time.monotonic()
 
     store.close()
+    if provider:
+        provider.shutdown()  # flush buffered spans
     log.info("stopped %s", dict(consumer.stats))

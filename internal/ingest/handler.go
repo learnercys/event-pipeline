@@ -9,6 +9,9 @@ import (
 	"log/slog"
 	"net/http"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/learnercys/event-pipeline/internal/chaos"
 	"github.com/learnercys/event-pipeline/internal/event"
 	"github.com/learnercys/event-pipeline/internal/store"
@@ -62,6 +65,8 @@ func (h *Handler) postEvent(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, response{Error: err.Error()})
 		return
 	}
+	trace.SpanFromContext(r.Context()).SetAttributes(
+		attribute.String("event.id", e.ID), attribute.String("event.type", string(e.Type)))
 
 	result, err := h.Store.Ingest(r.Context(), e)
 	if err != nil {

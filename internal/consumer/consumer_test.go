@@ -11,6 +11,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/learnercys/event-pipeline/internal/chaos"
 	"github.com/learnercys/event-pipeline/internal/event"
@@ -168,4 +174,48 @@ func TestCrashAfterCommitThenRedelivery(t *testing.T) {
 	if len(q.deleted) != 1 {
 		t.Fatal("the redelivered message should be acknowledged")
 	}
+}
+
+// The consumer's span continues the trace carried in the message attributes,
+// and the database work happens inside it.
+func TestProcessSpanContinuesTheMessageTrace(t *testing.T) {
+	rec := tracetest.NewSpanRecorder()
+	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec)))
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	t.Cleanup(func() { otel.SetTracerProvider(noop.NewTracerProvider()) })
+
+	pctx, publish := otel.Tracer("test").Start(context.Background(), "publish")
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(pctx, carrier)
+	publish.End()
+
+	m := msg("r1", capture)
+	m.MessageAttributes = map[string]types.MessageAttributeValue{
+		"traceparent": {DataType: aws.String("String"), StringValue: aws.String(carrier["traceparent"])},
+	}
+	l := &spanCheckingLedger{fakeLedger: newLedger()}
+	c := newConsumer(&fakeQueue{}, l, chaos.Disabled)
+	c.QueueURL = "http://sqs/123/ledger-events"
+	c.Handle(context.Background(), m)
+
+	process := rec.Ended()[1]
+	if process.Name() != "process ledger-events" || process.SpanKind() != trace.SpanKindConsumer {
+		t.Fatalf("unexpected span %q (%v)", process.Name(), process.SpanKind())
+	}
+	if process.Parent().SpanID() != publish.SpanContext().SpanID() {
+		t.Fatal("process span should be a child of the publish span")
+	}
+	if l.sawSpan != process.SpanContext().SpanID() {
+		t.Fatal("the ledger update should run inside the process span")
+	}
+}
+
+type spanCheckingLedger struct {
+	*fakeLedger
+	sawSpan trace.SpanID
+}
+
+func (l *spanCheckingLedger) ApplyToLedger(ctx context.Context, consumer string, e event.Event) (bool, error) {
+	l.sawSpan = trace.SpanContextFromContext(ctx).SpanID()
+	return l.fakeLedger.ApplyToLedger(ctx, consumer, e)
 }

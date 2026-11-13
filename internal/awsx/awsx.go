@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/aws/aws-sdk-go-v2/otelaws"
 )
 
 // Load reads the standard AWS configuration (env vars, profiles, IAM roles).
@@ -19,6 +20,8 @@ func Load(ctx context.Context) (aws.Config, error) {
 	if err != nil {
 		return aws.Config{}, fmt.Errorf("load aws config: %w", err)
 	}
+	// A client span for every AWS call (SNS publish, SQS receive/delete).
+	otelaws.AppendMiddlewares(&cfg.APIOptions)
 	return cfg, nil
 }
 

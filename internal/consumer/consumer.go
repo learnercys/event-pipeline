@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,9 +13,15 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/learnercys/event-pipeline/internal/chaos"
 	"github.com/learnercys/event-pipeline/internal/event"
+	"github.com/learnercys/event-pipeline/internal/telemetry"
 )
 
 // Queue is the part of the SQS API the consumer uses.
@@ -72,9 +79,10 @@ func (c *Consumer) worker(ctx context.Context) {
 			continue
 		}
 		out, err := c.Queue.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
-			QueueUrl:            aws.String(c.QueueURL),
-			MaxNumberOfMessages: 10,
-			WaitTimeSeconds:     10, // long polling: fewer empty receives
+			QueueUrl:              aws.String(c.QueueURL),
+			MaxNumberOfMessages:   10,
+			WaitTimeSeconds:       10,              // long polling: fewer empty receives
+			MessageAttributeNames: []string{"All"}, // includes the trace context
 		})
 		if err != nil {
 			if ctx.Err() == nil {
@@ -95,6 +103,15 @@ func (c *Consumer) worker(ctx context.Context) {
 			c.Handle(context.WithoutCancel(ctx), m)
 		}
 	}
+}
+
+var tracer = otel.Tracer("github.com/learnercys/event-pipeline/internal/consumer")
+
+func (c *Consumer) queueName() string {
+	if i := strings.LastIndex(c.QueueURL, "/"); i >= 0 {
+		return c.QueueURL[i+1:]
+	}
+	return c.QueueURL
 }
 
 // waitForDatabase is the circuit breaker's half-open state: probe with
@@ -127,17 +144,34 @@ func (c *Consumer) waitForDatabase(ctx context.Context) {
 // redelivers it after the visibility timeout and, after maxReceiveCount
 // attempts, moves it to the dead-letter queue.
 func (c *Consumer) Handle(ctx context.Context, m types.Message) {
+	// Continue the trace that the relay's publish span started.
+	ctx = telemetry.ExtractSQS(ctx, m.MessageAttributes)
+	ctx, span := tracer.Start(ctx, "process "+c.queueName(), trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(
+			semconv.MessagingSystemAWSSQS,
+			semconv.MessagingOperationTypeProcess,
+			semconv.MessagingDestinationName(c.queueName()),
+			semconv.MessagingMessageID(aws.ToString(m.MessageId)),
+			semconv.MessagingConsumerGroupName(c.Name),
+		))
+	defer span.End()
+
 	e, err := event.Decode([]byte(aws.ToString(m.Body)))
 	if err != nil {
 		// Poison message: retrying will never fix it. We leave it alone so the
 		// redrive policy moves it to the DLQ for a human to inspect.
 		c.Stats.Poison.Add(1)
+		span.SetStatus(codes.Error, "poison message")
 		c.Log.Warn("poison message", "message_id", aws.ToString(m.MessageId), "err", err)
 		return
 	}
+	span.SetAttributes(attribute.String("event.id", e.ID), attribute.String("event.type", string(e.Type)))
 
 	applied, err := c.Ledger.ApplyToLedger(ctx, c.Name, e)
+	span.SetAttributes(attribute.Bool("event.duplicate", err == nil && !applied))
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "apply failed")
 		c.Stats.Failed.Add(1)
 		if c.degraded.CompareAndSwap(false, true) {
 			c.Log.Warn("database failing, pausing consumption", "event_id", e.ID, "err", err)

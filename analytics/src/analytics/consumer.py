@@ -8,6 +8,10 @@ from collections import Counter
 from collections.abc import Callable
 from typing import Any, Protocol
 
+from opentelemetry import trace
+from opentelemetry.trace import SpanKind, Status, StatusCode
+
+from analytics import telemetry
 from analytics.chaos import Chaos
 from analytics.event import InvalidEvent, decode
 from analytics.store import SeenCache, Store
@@ -51,7 +55,10 @@ class Consumer:
             self.wait_for_database()
             return 0
         out = self.queue.receive_message(
-            QueueUrl=self.queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=10
+            QueueUrl=self.queue_url,
+            MaxNumberOfMessages=10,
+            WaitTimeSeconds=10,
+            MessageAttributeNames=["All"],  # includes the trace context
         )
         messages = out.get("Messages", [])
         for message in messages:
@@ -76,30 +83,54 @@ class Consumer:
             return
 
     def handle(self, message: dict[str, Any]) -> None:
-        """Process one message; delete it only once its effect is durable."""
+        """Process one message inside a span that continues the publisher's trace."""
+        queue = self.queue_url.rsplit("/", 1)[-1]
+        with telemetry.tracer.start_as_current_span(
+            f"process {queue}",
+            context=telemetry.extract(message.get("MessageAttributes")),
+            kind=SpanKind.CONSUMER,
+            attributes={
+                "messaging.system": "aws_sqs",
+                "messaging.operation.type": "process",
+                "messaging.destination.name": queue,
+                "messaging.message.id": message.get("MessageId", ""),
+                "messaging.consumer.group.name": self.name,
+            },
+        ):
+            self._handle(message)
+
+    def _handle(self, message: dict[str, Any]) -> None:
+        """Delete the message only once its effect is durable."""
+        span = trace.get_current_span()
         try:
             event = decode(message["Body"])
         except InvalidEvent as exc:
             # Leave it: the redrive policy moves it to the DLQ.
             self.stats["poison"] += 1
+            span.set_status(Status(StatusCode.ERROR, "poison message"))
             log.warning("poison message %s: %s", message.get("MessageId"), exc)
             return
+        span.set_attribute("event.id", event.id)
 
         if self.cache.seen(event.id):
             # Fast path: we know it was committed, skip the database round trip.
             self.stats["duplicates_cache"] += 1
+            span.set_attribute("event.duplicate", True)
             self._ack(message)
             return
 
         try:
             applied = self.store.apply(self.name, event)
-        except Exception:
+        except Exception as exc:
+            span.record_exception(exc)
+            span.set_status(Status(StatusCode.ERROR, "apply failed"))
             self.stats["failed"] += 1
             log.exception("apply failed for %s, pausing consumption", event.id)
             self.degraded = True
             return
 
         self.stats["applied" if applied else "duplicates_db"] += 1
+        span.set_attribute("event.duplicate", not applied)
         # Mark only after commit. Marking first would lose the event if we
         # crashed between the mark and the commit: the retry would be skipped.
         self.cache.mark(event.id)

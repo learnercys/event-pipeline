@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/learnercys/event-pipeline/internal/event"
+	"github.com/learnercys/event-pipeline/internal/telemetry"
 )
 
 // Store wraps a Postgres connection pool.
@@ -21,7 +23,14 @@ type Store struct {
 
 // New connects to Postgres and verifies the connection.
 func New(ctx context.Context, url string) (*Store, error) {
-	pool, err := pgxpool.New(ctx, url)
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		return nil, fmt.Errorf("parse database url: %w", err)
+	}
+	// One span per query, as children of whatever request or message is
+	// being handled.
+	cfg.ConnConfig.Tracer = otelpgx.NewTracer()
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect: %w", err)
 	}
@@ -104,7 +113,8 @@ func (s *Store) Ingest(ctx context.Context, e event.Event) (IngestResult, error)
 	}
 
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO outbox (event_id, payload) VALUES ($1, $2)`, e.ID, payload); err != nil {
+		`INSERT INTO outbox (event_id, payload, trace_context) VALUES ($1, $2, $3)`,
+		e.ID, payload, telemetry.Serialize(ctx)); err != nil {
 		return 0, fmt.Errorf("insert outbox: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -130,6 +140,8 @@ type OutboxRecord struct {
 	ID      int64
 	EventID string
 	Payload []byte
+	// TraceContext is the W3C trace context of the ingest request (JSON).
+	TraceContext []byte
 }
 
 // ErrAbort can be returned by a publish callback to roll back a batch on
@@ -152,7 +164,7 @@ func (s *Store) RelayBatch(ctx context.Context, limit int,
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op after commit
 
 	rows, err := tx.Query(ctx, `
-		SELECT id, event_id, payload FROM outbox
+		SELECT id, event_id, payload, trace_context FROM outbox
 		WHERE published_at IS NULL
 		ORDER BY id
 		LIMIT $1
@@ -162,7 +174,7 @@ func (s *Store) RelayBatch(ctx context.Context, limit int,
 	}
 	batch, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (OutboxRecord, error) {
 		var rec OutboxRecord
-		err := r.Scan(&rec.ID, &rec.EventID, &rec.Payload)
+		err := r.Scan(&rec.ID, &rec.EventID, &rec.Payload, &rec.TraceContext)
 		return rec, err
 	})
 	if err != nil {

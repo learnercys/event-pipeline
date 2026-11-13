@@ -153,3 +153,38 @@ def test_poison_message_is_left_for_dlq():
 def test_chaos_rejects_bad_spec(spec):
     with pytest.raises(ValueError):
         Chaos(spec)
+
+
+def test_process_span_continues_the_message_trace(monkeypatch):
+    from opentelemetry import trace
+    from opentelemetry.propagate import inject
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test")
+
+    with tracer.start_as_current_span("publish") as publish:
+        carrier: dict[str, str] = {}
+        inject(carrier)
+
+    import analytics.telemetry as tel
+
+    monkeypatch.setattr(tel, "tracer", tracer)
+    c, _ = make()
+    c.queue_url = "http://sqs/123/analytics-events"
+    m = msg("r1")
+    m["MessageAttributes"] = {
+        "traceparent": {"DataType": "String", "StringValue": carrier["traceparent"]}
+    }
+    c.handle(m)
+
+    process = exporter.get_finished_spans()[-1]
+    assert process.name == "process analytics-events"
+    assert process.kind == trace.SpanKind.CONSUMER
+    assert process.parent.span_id == publish.get_span_context().span_id
+    assert process.context.trace_id == publish.get_span_context().trace_id
+    assert process.attributes["event.id"] == "evt_1"
