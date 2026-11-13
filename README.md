@@ -127,6 +127,30 @@ one: it slows down noticeably past a few thousand queued messages. That's why
 the chaos test uses 1,500 events, and why downstream throughput isn't
 reported. Real SQS doesn't have that limit.
 
+## Tracing one event end to end
+
+Every process is instrumented with OpenTelemetry, and **one payment event is
+one trace**, across three hops that carry no HTTP headers:
+
+1. **ingest → outbox:** the request's W3C trace context is stored in the
+   outbox row, in the same transaction as the event.
+2. **relay → SNS:** the relay continues that trace in a producer span and
+   sends its own context as SNS message attributes.
+3. **SNS → SQS → consumers:** raw message delivery copies the attributes to
+   SQS, where the Go and Python consumers continue the trace.
+
+![One payment event traced across ingest, relay and both consumers](docs/trace-payment-event.jpg)
+
+The gaps between spans are the outbox polling delay and queue time, which is
+exactly what you want to see when a consumer falls behind. The relay and
+consumers only record spans that continue a trace, so their idle polling
+doesn't flood the backend
+([ADR 5](docs/adr/0005-tracing-across-async-hops.md)). Telemetry is configured
+entirely through the standard `OTEL_*` variables; with no exporter endpoint
+(as in `docker compose`) nothing is exported. The traces above come from the
+[platform](https://github.com/learnercys/platform) repo's local Kubernetes
+environment.
+
 ## Tests
 
 | Layer | What it covers |
@@ -150,6 +174,7 @@ internal/
   relay/             outbox → SNS
   consumer/          SQS worker pool, dedupe, circuit breaker
   chaos/             failure injection (CHAOS="point=probability,…")
+  telemetry/         OpenTelemetry setup and trace propagation across the hops
   verify/            invariants for the chaos test
 analytics/           Python consumer (uv, psycopg, boto3, redis)
 migrations/          schema
@@ -159,11 +184,14 @@ scripts/chaos.sh     the chaos scenario
 
 ## What I'd change for production
 
-- **Infrastructure as code.** Terraform for SNS, SQS, DLQs, queue policies and
-  IAM instead of `cmd/bootstrap`. That's planned for a separate platform repo.
-- **Observability.** OpenTelemetry traces that follow one event from the HTTP
-  request through SNS and SQS to both consumers. Prometheus metrics for outbox
-  lag, queue age, DLQ depth and breaker state, with alerts on DLQ depth > 0.
+- **Infrastructure as code.** In AWS, the
+  [platform](https://github.com/learnercys/platform) repo's Terraform creates
+  the SNS topic, queues, DLQs, queue policies and least-privilege IAM instead
+  of `cmd/bootstrap`.
+- **Pipeline metrics and alerts.** Traces and HTTP/DB metrics are in place;
+  next are outbox lag, queue age, DLQ depth and breaker state as metrics, with
+  an alert on DLQ depth > 0 (the Terraform in the platform repo already has
+  that CloudWatch alarm).
 - **Outbox and dedupe retention.** Delete published outbox rows and old
   `processed_messages` rows on a schedule, or partition both by day and drop
   old partitions.
